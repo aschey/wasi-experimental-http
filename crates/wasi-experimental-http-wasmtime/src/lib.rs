@@ -346,7 +346,7 @@ impl HttpCtx {
         })
     }
 
-    pub fn add_to_linker(&self, mut linker: &mut Linker<WasiCtx>) -> Result<(), Error> {
+    pub fn add_to_linker(&self, linker: &mut Linker<WasiCtx>) -> Result<(), Error> {
         let st = self.state.clone();
 
         linker.func_wrap1_async(
