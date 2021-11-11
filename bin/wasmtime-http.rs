@@ -1,8 +1,8 @@
+use ::tokio;
 use anyhow::{bail, Error};
 use structopt::StructOpt;
-use wasi_cap_std_sync::WasiCtxBuilder;
 use wasi_experimental_http_wasmtime::HttpCtx;
-use wasmtime::{AsContextMut, Engine, Func, Instance, Linker, Store, Val, ValType};
+use wasmtime::{Config, Engine, Func, Instance, Linker, Store, Val, ValType};
 use wasmtime_wasi::*;
 
 #[derive(Debug, StructOpt)]
@@ -52,23 +52,28 @@ async fn main() -> Result<(), Error> {
     let method = opt.invoke.clone();
     // println!("{:?}", opt);
     let (instance, mut store) =
-        create_instance(opt.module, opt.vars, opt.allowed_hosts, opt.max_concurrency)?;
+        create_instance(opt.module, opt.vars, opt.allowed_hosts, opt.max_concurrency).await?;
     let func = instance
         .get_func(&mut store, method.as_str())
         .unwrap_or_else(|| panic!("cannot find function {}", method));
 
-    invoke_func(func, opt.module_args, &mut store)?;
+    invoke_func(func, opt.module_args, &mut store).await?;
 
     Ok(())
 }
 
-fn create_instance(
+async fn create_instance(
     filename: String,
     vars: Vec<(String, String)>,
     allowed_hosts: Option<Vec<String>>,
     max_concurrent_requests: Option<u32>,
 ) -> Result<(Instance, Store<WasiCtx>), Error> {
-    let engine = Engine::default();
+    let mut config = Config::new();
+
+    config.async_support(true);
+    config.consume_fuel(true);
+
+    let engine = Engine::new(&config).unwrap();
     let mut linker = Linker::new(&engine);
 
     let ctx = WasiCtxBuilder::new()
@@ -79,10 +84,13 @@ fn create_instance(
         .build();
 
     let mut store = Store::new(&engine, ctx);
-    wasmtime_wasi::add_to_linker(&mut linker, |cx| cx)?;
+    store.add_fuel(10000)?;
+    store.out_of_fuel_async_yield(u64::MAX, 10000);
+
+    wasmtime_wasi::tokio::add_to_linker(&mut linker, |cx| cx)?;
 
     // Link `wasi_experimental_http`
-    let http = HttpCtx::new(allowed_hosts, max_concurrent_requests)?;
+    let http = HttpCtx::new(allowed_hosts, max_concurrent_requests).await?;
     http.add_to_linker(&mut linker)?;
 
     let module = wasmtime::Module::from_file(store.engine(), filename)?;
@@ -93,7 +101,11 @@ fn create_instance(
 
 // Invoke function given module arguments and print results.
 // Adapted from https://github.com/bytecodealliance/wasmtime/blob/main/src/commands/run.rs.
-fn invoke_func(func: Func, args: Vec<String>, mut store: impl AsContextMut) -> Result<(), Error> {
+async fn invoke_func(
+    func: Func,
+    args: Vec<String>,
+    mut store: &mut Store<WasiCtx>,
+) -> Result<(), Error> {
     let ty = func.ty(&mut store);
 
     let mut args = args.iter();
@@ -114,8 +126,9 @@ fn invoke_func(func: Func, args: Vec<String>, mut store: impl AsContextMut) -> R
         });
     }
 
-    let results = func.call(&mut store, &values)?;
-    for result in results.into_vec() {
+    let mut results = vec![];
+    func.call_async(&mut store, &values, &mut results).await?;
+    for result in results {
         match result {
             Val::I32(i) => println!("{}", i),
             Val::I64(i) => println!("{}", i),

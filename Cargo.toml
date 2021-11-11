@@ -1,22 +1,21 @@
 [package]
-name    = "wasi-experimental-http-wasmtime-sample"
-version = "0.6.0"
 authors = ["Radu Matei <radu.matei@microsoft.com>"]
 edition = "2018"
+name = "wasi-experimental-http-wasmtime-sample"
+version = "0.6.0"
 
 [dependencies]
-anyhow                          = "1.0"
-futures                         = "0.3"
-http                            = "0.2"
-reqwest                         = { version = "0.11", default-features = true, features = ["json", "blocking"] }
-structopt                       = "0.3.21"
-tokio                           = { version = "1.4.0", features = ["full"] }
-wasmtime                        = "0.30.0"
-wasmtime-wasi                   = "0.30.0"
-wasi-common                     = "0.30.0"
-wasi-cap-std-sync               = "0.30.0"
-wasi-experimental-http          = { path = "crates/wasi-experimental-http" }
-wasi-experimental-http-wasmtime = { path = "crates/wasi-experimental-http-wasmtime" }
+anyhow = "1.0"
+futures = "0.3"
+http = "0.2"
+reqwest = {version = "0.11", features = ["json"]}
+structopt = "0.3.21"
+tokio = {version = "1.4.0", features = ["full"]}
+wasi-common = "0.31.0"
+wasi-experimental-http = {path = "crates/wasi-experimental-http"}
+wasi-experimental-http-wasmtime = {path = "crates/wasi-experimental-http-wasmtime"}
+wasmtime = {version = "0.31.0", features = ["async"]}
+wasmtime-wasi = {version = "0.31.0", features = ["tokio"]}
 
 [workspace]
 members = ["crates/wasi-experimental-http", "crates/wasi-experimental-http-wasmtime", "tests/rust"]

@@ -6,10 +6,11 @@ use reqwest::{Client, Method};
 use std::{
     collections::HashMap,
     str::FromStr,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{Arc, PoisonError},
 };
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, sync::RwLock};
 use url::Url;
+use wasi_common::WasiCtx;
 use wasmtime::*;
 
 const MEMORY: &str = "memory";
@@ -113,15 +114,15 @@ impl HostCalls {
     // TODO (@radu-matei)
     // Fix the clippy warning.
     #[allow(clippy::unnecessary_wraps)]
-    fn close(st: Arc<RwLock<State>>, handle: WasiHttpHandle) -> Result<(), HttpError> {
-        let mut st = st.write()?;
+    async fn close(st: Arc<RwLock<State>>, handle: WasiHttpHandle) -> Result<(), HttpError> {
+        let mut st = st.write().await;
         st.responses.remove(&handle);
         Ok(())
     }
 
     /// Read `buf_len` bytes from the response of `handle` and
     /// write them into `buf_ptr`.
-    fn body_read(
+    async fn body_read(
         st: Arc<RwLock<State>>,
         memory: Memory,
         mut store: impl AsContextMut,
@@ -130,7 +131,7 @@ impl HostCalls {
         buf_len: u32,
         buf_read_ptr: u32,
     ) -> Result<(), HttpError> {
-        let mut st = st.write()?;
+        let mut st = st.write().await;
 
         let mut body = &mut st.responses.get_mut(&handle).unwrap().body;
         let mut context = store.as_context_mut();
@@ -155,7 +156,7 @@ impl HostCalls {
 
     /// Get a response header value given a key.
     #[allow(clippy::too_many_arguments)]
-    fn header_get(
+    async fn header_get(
         st: Arc<RwLock<State>>,
         memory: Memory,
         mut store: impl AsContextMut,
@@ -166,7 +167,7 @@ impl HostCalls {
         value_len: u32,
         value_written_ptr: u32,
     ) -> Result<(), HttpError> {
-        let st = st.read()?;
+        let st = st.read().await;
 
         // Get the current response headers.
         let headers = &st
@@ -194,7 +195,7 @@ impl HostCalls {
         Ok(())
     }
 
-    fn headers_get_all(
+    async fn headers_get_all(
         st: Arc<RwLock<State>>,
         memory: Memory,
         mut store: impl AsContextMut,
@@ -203,7 +204,7 @@ impl HostCalls {
         buf_len: u32,
         buf_written_ptr: u32,
     ) -> Result<(), HttpError> {
-        let st = st.read()?;
+        let st = st.read().await;
 
         let headers = &st
             .responses
@@ -234,7 +235,7 @@ impl HostCalls {
     /// Execute a request for a guest module, given
     /// the request data.
     #[allow(clippy::too_many_arguments)]
-    fn req(
+    async fn req(
         st: Arc<RwLock<State>>,
         allowed_hosts: Option<&[String]>,
         max_concurrent_requests: Option<u32>,
@@ -254,7 +255,7 @@ impl HostCalls {
         let span = tracing::trace_span!("req");
         let _enter = span.enter();
 
-        let mut st = st.write()?;
+        let mut st = st.write().await;
         if let Some(max) = max_concurrent_requests {
             if st.responses.len() > (max - 1) as usize {
                 return Err(HttpError::TooManySessions);
@@ -282,7 +283,7 @@ impl HostCalls {
 
         // Send the request.
         let (status, resp_headers, resp_body) =
-            request(url.as_str(), headers, method, req_body.as_slice())?;
+            request(url.as_str(), headers, method, req_body.as_slice()).await?;
         tracing::debug!(
             status,
             ?resp_headers,
@@ -332,7 +333,7 @@ impl HttpCtx {
     /// Create a new HTTP extension object.
     /// `allowed_hosts` may be `None` (no outbound connections allowed)
     /// or a list of allowed host names.
-    pub fn new(
+    pub async fn new(
         allowed_hosts: Option<Vec<String>>,
         max_concurrent_requests: Option<u32>,
     ) -> Result<Self, Error> {
@@ -345,126 +346,145 @@ impl HttpCtx {
         })
     }
 
-    pub fn add_to_linker<T>(&self, linker: &mut Linker<T>) -> Result<(), Error> {
+    pub fn add_to_linker(&self, mut linker: &mut Linker<WasiCtx>) -> Result<(), Error> {
         let st = self.state.clone();
-        linker.func_wrap(
+
+        linker.func_wrap1_async(
             Self::MODULE,
             "close",
-            move |handle: WasiHttpHandle| -> u32 {
-                match HostCalls::close(st.clone(), handle) {
-                    Ok(()) => 0,
-                    Err(e) => e.into(),
-                }
+            move |_caller, handle: WasiHttpHandle| {
+                let st = st.clone();
+                Box::new(async move {
+                    match HostCalls::close(st.clone(), handle).await {
+                        Ok(()) => Ok(0),
+                        Err(e) => Err(Trap::new(e.to_string())),
+                    }
+                })
             },
         )?;
 
         let st = self.state.clone();
-        linker.func_wrap(
+        linker.func_wrap4_async(
             Self::MODULE,
             "body_read",
-            move |mut caller: Caller<'_, T>,
+            move |mut caller,
                   handle: WasiHttpHandle,
                   buf_ptr: u32,
                   buf_len: u32,
-                  buf_read_ptr: u32|
-                  -> u32 {
-                let memory = match memory_get(&mut caller) {
-                    Ok(m) => m,
-                    Err(e) => return e.into(),
-                };
+                  buf_read_ptr: u32| {
+                let st = st.clone();
+                Box::new(async move {
+                    let memory = match memory_get(&mut caller) {
+                        Ok(m) => m,
+                        Err(e) => return Err(Trap::new(e.to_string())),
+                    };
 
-                let ctx = caller.as_context_mut();
+                    let ctx = caller.as_context_mut();
 
-                match HostCalls::body_read(
-                    st.clone(),
-                    memory,
-                    ctx,
-                    handle,
-                    buf_ptr,
-                    buf_len,
-                    buf_read_ptr,
-                ) {
-                    Ok(()) => 0,
-                    Err(e) => e.into(),
-                }
+                    match HostCalls::body_read(
+                        st.clone(),
+                        memory,
+                        ctx,
+                        handle,
+                        buf_ptr,
+                        buf_len,
+                        buf_read_ptr,
+                    )
+                    .await
+                    {
+                        Ok(()) => Ok(0),
+                        Err(e) => Err(Trap::new(e.to_string())),
+                    }
+                })
             },
         )?;
 
         let st = self.state.clone();
-        linker.func_wrap(
+        linker.func_wrap6_async(
             Self::MODULE,
             "header_get",
-            move |mut caller: Caller<'_, T>,
+            move |mut caller,
                   handle: WasiHttpHandle,
                   name_ptr: u32,
                   name_len: u32,
                   value_ptr: u32,
                   value_len: u32,
-                  value_written_ptr: u32|
-                  -> u32 {
-                let memory = match memory_get(&mut caller) {
-                    Ok(m) => m,
-                    Err(e) => return e.into(),
-                };
+                  value_written_ptr: u32| {
+                let st = st.clone();
+                Box::new(async move {
+                    {
+                        let memory = match memory_get(&mut caller) {
+                            Ok(m) => m,
+                            Err(e) => return e.into(),
+                        };
 
-                let ctx = caller.as_context_mut();
+                        let ctx = caller.as_context_mut();
 
-                match HostCalls::header_get(
-                    st.clone(),
-                    memory,
-                    ctx,
-                    handle,
-                    name_ptr,
-                    name_len,
-                    value_ptr,
-                    value_len,
-                    value_written_ptr,
-                ) {
-                    Ok(()) => 0,
-                    Err(e) => e.into(),
-                }
+                        match HostCalls::header_get(
+                            st.clone(),
+                            memory,
+                            ctx,
+                            handle,
+                            name_ptr,
+                            name_len,
+                            value_ptr,
+                            value_len,
+                            value_written_ptr,
+                        )
+                        .await
+                        {
+                            Ok(()) => 0,
+                            Err(e) => e.into(),
+                        }
+                    }
+                })
             },
         )?;
 
         let st = self.state.clone();
-        linker.func_wrap(
+        linker.func_wrap4_async(
             Self::MODULE,
             "headers_get_all",
-            move |mut caller: Caller<'_, T>,
+            move |mut caller,
                   handle: WasiHttpHandle,
                   buf_ptr: u32,
                   buf_len: u32,
-                  buf_read_ptr: u32|
-                  -> u32 {
-                let memory = match memory_get(&mut caller) {
-                    Ok(m) => m,
-                    Err(e) => return e.into(),
-                };
+                  buf_read_ptr: u32| {
+                let st = st.clone();
+                Box::new(async move {
+                    let memory = match memory_get(&mut caller) {
+                        Ok(m) => m,
+                        Err(e) => return e.into(),
+                    };
 
-                let ctx = caller.as_context_mut();
+                    let ctx = caller.as_context_mut();
 
-                match HostCalls::headers_get_all(
-                    st.clone(),
-                    memory,
-                    ctx,
-                    handle,
-                    buf_ptr,
-                    buf_len,
-                    buf_read_ptr,
-                ) {
-                    Ok(()) => 0,
-                    Err(e) => e.into(),
-                }
+                    match HostCalls::headers_get_all(
+                        st.clone(),
+                        memory,
+                        ctx,
+                        handle,
+                        buf_ptr,
+                        buf_len,
+                        buf_read_ptr,
+                    )
+                    .await
+                    {
+                        Ok(()) => 0,
+                        Err(e) => e.into(),
+                    }
+                })
             },
         )?;
 
         let st = self.state.clone();
         let allowed_hosts = self.allowed_hosts.clone();
         let max_concurrent_requests = self.max_concurrent_requests;
-        linker.func_wrap(
+
+        linker.func_wrap10_async(
             Self::MODULE,
             "req",
-            move |mut caller: Caller<'_, T>,
+            move |mut caller,
                   url_ptr: u32,
                   url_len: u32,
                   method_ptr: u32,
@@ -474,44 +494,49 @@ impl HttpCtx {
                   req_body_ptr: u32,
                   req_body_len: u32,
                   status_code_ptr: u32,
-                  res_handle_ptr: u32|
-                  -> u32 {
-                let memory = match memory_get(&mut caller) {
-                    Ok(m) => m,
-                    Err(e) => return e.into(),
-                };
+                  res_handle_ptr: u32| {
+                let st = st.clone();
+                let allowed_hosts = allowed_hosts.clone();
+                Box::new(async move {
+                    let memory = match memory_get(&mut caller) {
+                        Ok(m) => m,
+                        Err(e) => return Err(Trap::new(e.to_string())),
+                    };
 
-                let ctx = caller.as_context_mut();
+                    let ctx = caller.as_context_mut();
 
-                match HostCalls::req(
-                    st.clone(),
-                    allowed_hosts.as_deref(),
-                    max_concurrent_requests,
-                    memory,
-                    ctx,
-                    url_ptr,
-                    url_len,
-                    method_ptr,
-                    method_len,
-                    req_headers_ptr,
-                    req_headers_len,
-                    req_body_ptr,
-                    req_body_len,
-                    status_code_ptr,
-                    res_handle_ptr,
-                ) {
-                    Ok(()) => 0,
-                    Err(e) => e.into(),
-                }
+                    match HostCalls::req(
+                        st.clone(),
+                        allowed_hosts.as_deref(),
+                        max_concurrent_requests,
+                        memory,
+                        ctx,
+                        url_ptr,
+                        url_len,
+                        method_ptr,
+                        method_len,
+                        req_headers_ptr,
+                        req_headers_len,
+                        req_body_ptr,
+                        req_body_len,
+                        status_code_ptr,
+                        res_handle_ptr,
+                    )
+                    .await
+                    {
+                        Ok(()) => Ok(0),
+                        Err(e) => Err(Trap::new(e.to_string())),
+                    }
+                })
             },
         )?;
-
+        //wasmtime_wasi::tokio::add_to_linker(&mut linker, |cx| cx)?;
         Ok(())
     }
 }
 
 #[tracing::instrument]
-fn request(
+async fn request(
     url: &str,
     headers: HeaderMap,
     method: Method,
@@ -621,8 +646,11 @@ fn is_allowed(url: &str, allowed_hosts: Option<&[String]>) -> Result<bool, HttpE
         Some(domains) => {
             let allowed: Result<Vec<_>, _> = domains.iter().map(|d| Url::parse(d)).collect();
             let allowed = allowed.map_err(|_| HttpError::InvalidUrl)?;
-            let a: Vec<&str> = allowed.iter().map(|u| u.host_str().unwrap()).collect();
-            Ok(a.contains(&url_host.as_str()))
+
+            Ok(allowed
+                .iter()
+                .map(|u| u.host_str().unwrap())
+                .any(|x| x == url_host.as_str()))
         }
         None => Ok(false),
     }

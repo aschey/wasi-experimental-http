@@ -29,10 +29,7 @@ fn main() {
 fn cargo_build_example(dir: &str, example: &str) {
     let dir = format!("{}/{}", dir, example);
 
-    run(
-        vec!["cargo", "build", "--target", "wasm32-wasi", "--release"],
-        Some(dir),
-    );
+    run(vec!["cargo", "wasi", "build", "--release"], Some(dir));
 }
 
 fn as_build_example(dir: &str, example: &str) {
